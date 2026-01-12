@@ -222,14 +222,69 @@ EXT_NUMPY_ARRAY = 6
 
 
 def _msgpack_default(obj: Any) -> str | ormsgpack.Ext:
+    # Special handling for langchain_core BaseMessage to preserve all fields
+    # including tool_calls during serialization (issue #6675).
+    # Must come before Pydantic handling since BaseMessage is also a Pydantic model.
+    try:
+        from langchain_core.messages import BaseMessage
+
+        if isinstance(obj, BaseMessage):
+            # Serialize BaseMessage directly with its own model_dump()
+            return ormsgpack.Ext(
+                EXT_PYDANTIC_V2,
+                _msgpack_enc(
+                    (
+                        obj.__class__.__module__,
+                        obj.__class__.__name__,
+                        obj.model_dump(),
+                        "model_validate_json",
+                    ),
+                ),
+            )
+    except ImportError:
+        pass
+
     if hasattr(obj, "model_dump") and callable(obj.model_dump):  # pydantic v2
+        # For Pydantic models with BaseMessage fields, manually serialize those
+        # fields to preserve complete data (issue #6675)
+        try:
+            from langchain_core.messages import BaseMessage
+
+            dumped = {}
+            has_messages = False
+
+            for field_name in obj.__class__.model_fields.keys():
+                field_value = getattr(obj, field_name)
+                # Check if this field contains BaseMessage objects in a list
+                if isinstance(field_value, list) and field_value:
+                    if isinstance(field_value[0], BaseMessage):
+                        # Manually serialize each message with its own model_dump()
+                        # to preserve all subclass-specific fields like tool_calls
+                        dumped[field_name] = [item.model_dump() for item in field_value]
+                        has_messages = True
+                        continue
+
+                # For other fields, get value from standard model_dump
+                if not has_messages:
+                    # Only call model_dump once if we don't have messages
+                    dumped = obj.model_dump()
+                    break
+                else:
+                    # Get this field's value from model_dump
+                    field_dumped = obj.model_dump(include={field_name})
+                    dumped[field_name] = field_dumped.get(field_name)
+
+        except (ImportError, Exception):
+            # Fall back to standard model_dump if anything goes wrong
+            dumped = obj.model_dump()
+
         return ormsgpack.Ext(
             EXT_PYDANTIC_V2,
             _msgpack_enc(
                 (
                     obj.__class__.__module__,
                     obj.__class__.__name__,
-                    obj.model_dump(),
+                    dumped,
                     "model_validate_json",
                 ),
             ),
@@ -512,10 +567,12 @@ def _msgpack_ext_hook(code: int, data: bytes) -> Any:
             )
             # module, name, kwargs, method
             cls = getattr(importlib.import_module(tup[0]), tup[1])
+            kwargs = tup[2]
+
             try:
-                return cls(**tup[2])
+                return cls(**kwargs)
             except Exception:
-                return cls.model_construct(**tup[2])
+                return cls.model_construct(**kwargs)
         except Exception:
             # for pydantic objects we can't find/reconstruct
             # let's return the kwargs dict instead

@@ -514,3 +514,57 @@ def test_serde_jsonplus_pandas_series(series: pd.Series) -> None:
     result = serde.loads_typed(dumped)
 
     assert result.equals(series)
+
+
+def test_serde_jsonplus_pydantic_with_aimessage_tool_calls() -> None:
+    """Test that AIMessage with tool_calls are preserved during serialization (issue #6675)."""
+    try:
+        from langchain_core.messages import AIMessage, BaseMessage, ToolCall
+    except ImportError:
+        pytest.skip("langchain_core not available")
+
+    from typing import Annotated
+
+    class State(BaseModel):
+        messages: Annotated[list[BaseMessage], lambda x: x]
+
+    msg = AIMessage(
+        content="foo",
+        tool_calls=[
+            ToolCall(id="bar", args={"baz": "qux"}, name="quux"),
+        ],
+    )
+    state = State(messages=[msg])
+
+    # Verify that the message has tool_calls before serialization
+    assert len(state.messages) == 1
+    assert state.messages[0].tool_calls
+    assert state.messages[0].tool_calls[0]["id"] == "bar"
+    assert state.messages[0].tool_calls[0]["name"] == "quux"
+
+    serde = JsonPlusSerializer(pickle_fallback=True)
+    dumped = serde.dumps_typed(state)
+    result = serde.loads_typed(dumped)
+
+    # Verify that tool_calls are preserved after serialization/deserialization
+    # The result might be a dict if the class can't be reconstructed (local scope)
+    if isinstance(result, dict):
+        messages = result["messages"]
+    else:
+        messages = result.messages
+
+    assert len(messages) == 1
+    # Messages should have tool_calls preserved regardless of exact type
+    msg_result = messages[0]
+    assert hasattr(msg_result, "tool_calls") or "tool_calls" in msg_result
+
+    if hasattr(msg_result, "tool_calls"):
+        tool_calls = msg_result.tool_calls
+    else:
+        tool_calls = msg_result["tool_calls"]
+
+    assert tool_calls
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["id"] == "bar"
+    assert tool_calls[0]["name"] == "quux"
+    assert tool_calls[0]["args"] == {"baz": "qux"}
